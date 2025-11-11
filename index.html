@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>EnChat</title>
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <style>
+    body {
+      font-family: system-ui, Segoe UI, Roboto, Arial;
+      margin: 18px;
+      max-width: 900px
+    }
+
+    .row {
+      display: flex;
+      gap: 12px
+    }
+
+    .card {
+      padding: 12px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      flex: 1
+    }
+
+    textarea {
+      width: 100%;
+      height: 80px
+    }
+
+    #chat {
+      height: 280px;
+      overflow: auto;
+      background: #f9f9f9;
+      padding: 8px;
+      border-radius: 6px
+    }
+
+    button {
+      padding: 8px 12px;
+      border-radius: 6px
+    }
+
+    .small {
+      font-size: 12px;
+      color: #666
+    }
+  </style>
+</head>
+
+<body>
+  <h1>EnChat</h1>
+  <p class="small">
+    Uses WebRTC DataChannels for P2P communication and the Web Crypto API for hybrid encryption (AES-GCM + RSA-OAEP).
+    Exchange QR codes or JSON payloads manually to connect peers.
+  </p>
+
+  <div class="row">
+    <div class="card">
+      <h3>Your Offer (QR / JSON)</h3>
+      <div id="qrcode"></div>
+      <p class="small">Share this QR or JSON with a peer to let them connect to you.</p>
+      <pre id="myOffer" style="width:20em;"></pre>
+      <button id="createOfferBtn">Create Offer</button>
+    </div>
+
+    <div class="card">
+      <h3>Connect / Answer</h3>
+      <p class="small">Paste scanned QR JSON here and press the appropriate button.</p>
+      <textarea id="remotePayload" placeholder='{"type":"offer","sdp":"...","pubkey":"..."}'></textarea>
+      <div style="margin-top:8px">
+        <button id="createAnswerBtn">Create Answer</button>
+        <button id="acceptAnswerBtn">Accept Answer</button>
+      </div>
+      <p id="status" class="small">Status: <span id="statusText">Idle</span></p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Chat</h3>
+    <div id="chat"></div>
+    <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+      <input id="msgInput" placeholder="Type message"
+        style="flex:1;padding:8px;border-radius:6px;border:1px solid #ccc" />
+      <button id="sendBtn">Send</button>
+    </div>
+  </div>
+
+  <script>
+    (async function () {
+      // ---------- Helper Functions ----------
+      const abToBase64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const base64ToAb = str => {
+        const bin = atob(str);
+        const buf = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        return buf.buffer;
+      };
+      const logChat = (msg, cls) => {
+        const el = document.getElementById('chat');
+        const p = document.createElement('div');
+        p.textContent = msg;
+        if (cls === 'me') { p.style.textAlign = 'right'; p.style.fontWeight = '600'; }
+        el.appendChild(p); el.scrollTop = el.scrollHeight;
+      };
+      const setStatus = s => document.getElementById('statusText').textContent = s;
+
+      // ---------- Crypto ----------
+      async function generateRSAKeyPair() {
+        return crypto.subtle.generateKey({
+          name: 'RSA-OAEP',
+          modulusLength: 2048,
+          publicExponent: new Uint8Array([1, 0, 1]),
+          hash: 'SHA-256'
+        }, true, ['encrypt', 'decrypt']);
+      }
+      async function exportPublicKeyBase64(pubKey) {
+        const spki = await crypto.subtle.exportKey('spki', pubKey);
+        return abToBase64(spki);
+      }
+      async function importPublicKeyFromBase64(b64) {
+        const buf = base64ToAb(b64);
+        return crypto.subtle.importKey('spki', buf, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']);
+      }
+      async function encryptForRecipient(recipientPublicKey, plaintext) {
+        const aesKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, new TextEncoder().encode(plaintext));
+        const rawAes = await crypto.subtle.exportKey('raw', aesKey);
+        const encryptedAesKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, recipientPublicKey, rawAes);
+        return { key: abToBase64(encryptedAesKey), ct: abToBase64(ct), iv: abToBase64(iv) };
+      }
+      async function decryptEnvelope(env, myPrivateKey) {
+        const rawAes = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, myPrivateKey, base64ToAb(env.key));
+        const aesKey = await crypto.subtle.importKey('raw', rawAes, { name: 'AES-GCM' }, false, ['decrypt']);
+        const ptBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToAb(env.iv) }, aesKey, base64ToAb(env.ct));
+        return new TextDecoder().decode(ptBuf);
+      }
+      async function getIceServers() {
+        try {
+          const res = await fetch('https://enchat.metered.live/api/v1/turn/credentials?apiKey=32cff7f5e8c97ce40bfc9ba183026abd3165');
+          const data = await res.json();
+          // Map Metered credentials to WebRTC iceServers format
+          const turnServers = data.map(d => ({
+            urls: d.urls,
+            username: d.username,
+            credential: d.credential
+          }));
+          return [
+            ...turnServers
+          ];
+        } catch (err) {
+          console.warn('Failed to fetch TURN credentials, using STUN only', err);
+          return [{ urls: "stun:stun.l.google.com:19302" }];
+        }
+      }
+
+      // ---------- WebRTC setup ----------
+      const iceServers = await getIceServers();
+      console.log('iceServers', iceServers);
+      let pc = new RTCPeerConnection({ iceServers });
+      let dataChannel = null;
+      let myKeyPair = await generateRSAKeyPair();
+      let myPubKeyB64 = await exportPublicKeyBase64(myKeyPair.publicKey);
+      let otherPublicKey = null;
+
+      const qrcodeEl = document.getElementById('qrcode');
+      const myOfferEl = document.getElementById('myOffer');
+      const remotePayloadEl = document.getElementById('remotePayload');
+      const msgInput = document.getElementById('msgInput');
+      const sendBtn = document.getElementById('sendBtn');
+      const createOfferBtn = document.getElementById('createOfferBtn');
+      const createAnswerBtn = document.getElementById('createAnswerBtn');
+      const acceptAnswerBtn = document.getElementById('acceptAnswerBtn');
+
+      async function createPeer() {
+        pc = new RTCPeerConnection({ iceServers });
+        pc.oniceconnectionstatechange = () => setStatus(pc.iceConnectionState);
+        pc.onconnectionstatechange = () => setStatus(pc.connectionState);
+        pc.ondatachannel = e => {
+          dataChannel = e.channel;
+          setupDataChannel();
+        };
+      }
+
+      function setupDataChannel() {
+        dataChannel.onopen = () => setStatus('Connected');
+        dataChannel.onclose = () => setStatus('Disconnected');
+        dataChannel.onmessage = async e => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'envelope') {
+              const pt = await decryptEnvelope(msg.payload, myKeyPair.privateKey);
+              logChat('Peer: ' + pt);
+            } else if (msg.type === 'pubkey') {
+              otherPublicKey = await importPublicKeyFromBase64(msg.pubkey);
+              logChat('System: received remote public key');
+            }
+          } catch (err) {
+            console.error(err);
+          }
+        };
+      }
+
+      // ---------- Offer / Answer ----------
+      createOfferBtn.onclick = async () => {
+        await createPeer();
+        dataChannel = pc.createDataChannel('chat');
+        setupDataChannel();
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        const payload = { type: 'offer', sdp: offer.sdp, pubkey: myPubKeyB64 };
+        const payloadStr = JSON.stringify(payload);
+        myOfferEl.textContent = payloadStr;
+        qrcodeEl.innerHTML = '';
+        new QRCode(qrcodeEl, { text: payloadStr, width: 200, height: 200 });
+        setStatus('Offer created. Share this with peer.');
+
+        pc.onicecandidate = e => {
+          if (!e.candidate && pc.localDescription) {
+            // final localDescription already included
+          }
+        };
+      };
+
+      createAnswerBtn.onclick = async () => {
+        const txt = remotePayloadEl.value.trim();
+        if (!txt) return alert('Paste remote offer JSON first');
+        const remote = JSON.parse(txt);
+        if (remote.type !== 'offer') return alert('Invalid payload (expected offer)');
+
+        otherPublicKey = await importPublicKeyFromBase64(remote.pubkey);
+        await createPeer();
+        await pc.setRemoteDescription({ type: 'offer', sdp: remote.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        const payload = { type: 'answer', sdp: answer.sdp, pubkey: myPubKeyB64 };
+        remotePayloadEl.value = JSON.stringify(payload);
+        setStatus('Answer created. Send this JSON back to the offerer.');
+      };
+
+      acceptAnswerBtn.onclick = async () => {
+        const txt = remotePayloadEl.value.trim();
+        if (!txt) return alert('Paste remote answer JSON first');
+        const remote = JSON.parse(txt);
+        if (remote.type !== 'answer') return alert('Invalid payload (expected answer)');
+        otherPublicKey = await importPublicKeyFromBase64(remote.pubkey);
+        await pc.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
+        setStatus('Connection established!');
+        if (dataChannel?.readyState === 'open') {
+          dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
+        } else {
+          dataChannel.onopen = () => {
+            dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
+          };
+        }
+      };
+
+      sendBtn.onclick = async () => {
+        if (!dataChannel || dataChannel.readyState !== 'open')
+          return alert('Not connected');
+        const txt = msgInput.value.trim();
+        if (!txt) return;
+        if (!otherPublicKey) return alert('No remote public key known.');
+        const env = await encryptForRecipient(otherPublicKey, txt);
+        dataChannel.send(JSON.stringify({ type: 'envelope', payload: env }));
+        logChat('Me: ' + txt, 'me');
+        msgInput.value = '';
+      };
+    })();
+  </script>
+</body>
+
+</html>
