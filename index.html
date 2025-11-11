@@ -109,61 +109,41 @@
 
       // ---------- Crypto ----------
       async function generateRSAKeyPair() {
-        return crypto.subtle.generateKey({
-          name: 'RSA-OAEP',
-          modulusLength: 2048,
-          publicExponent: new Uint8Array([1, 0, 1]),
-          hash: 'SHA-256'
-        }, true, ['encrypt', 'decrypt']);
+        return crypto.subtle.generateKey({ name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['encrypt', 'decrypt']);
       }
-      async function exportPublicKeyBase64(pubKey) {
-        const spki = await crypto.subtle.exportKey('spki', pubKey);
-        return abToBase64(spki);
-      }
-      async function importPublicKeyFromBase64(b64) {
-        const buf = base64ToAb(b64);
-        return crypto.subtle.importKey('spki', buf, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']);
-      }
-      async function encryptForRecipient(recipientPublicKey, plaintext) {
+      async function exportPublicKeyBase64(pubKey) { return abToBase64(await crypto.subtle.exportKey('spki', pubKey)); }
+      async function importPublicKeyFromBase64(b64) { return crypto.subtle.importKey('spki', base64ToAb(b64), { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']); }
+      async function encryptForRecipient(pubKey, plaintext) {
         const aesKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, new TextEncoder().encode(plaintext));
         const rawAes = await crypto.subtle.exportKey('raw', aesKey);
-        const encryptedAesKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, recipientPublicKey, rawAes);
+        const encryptedAesKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, pubKey, rawAes);
         return { key: abToBase64(encryptedAesKey), ct: abToBase64(ct), iv: abToBase64(iv) };
       }
-      async function decryptEnvelope(env, myPrivateKey) {
-        const rawAes = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, myPrivateKey, base64ToAb(env.key));
+      async function decryptEnvelope(env, privKey) {
+        const rawAes = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, privKey, base64ToAb(env.key));
         const aesKey = await crypto.subtle.importKey('raw', rawAes, { name: 'AES-GCM' }, false, ['decrypt']);
         const ptBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToAb(env.iv) }, aesKey, base64ToAb(env.ct));
         return new TextDecoder().decode(ptBuf);
       }
-      async function getIceServers() {
-        try {
-          const res = await fetch('https://enchat.metered.live/api/v1/turn/credentials?apiKey=32cff7f5e8c97ce40bfc9ba183026abd3165');
-          const data = await res.json();
-          // Map Metered credentials to WebRTC iceServers format
-          const turnServers = data.map(d => ({
-            urls: d.urls,
-            username: d.username,
-            credential: d.credential
-          }));
-          return [
-            ...turnServers
-          ];
-        } catch (err) {
-          console.warn('Failed to fetch TURN credentials, using STUN only', err);
-          return [{ urls: "stun:stun.l.google.com:19302" }];
-        }
+
+      // ---------- Fetch ICE servers ----------
+      let iceServers;
+      try {
+        const res = await fetch('https://enchat.metered.live/api/v1/turn/credentials?apiKey=32cff7f5e8c97ce40bfc9ba183026abd3165');
+        iceServers = await res.json();
+        console.log("Fetched ICE servers:", iceServers);
+      } catch (err) {
+        console.warn('Failed to fetch TURN credentials, using STUN only', err);
+        iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
       }
 
-      // ---------- WebRTC setup ----------
-      const iceServers = await getIceServers();
-      console.log('iceServers', iceServers);
-      let pc = new RTCPeerConnection({ iceServers });
+      // ---------- State ----------
+      let pc = null;
       let dataChannel = null;
-      let myKeyPair = await generateRSAKeyPair();
-      let myPubKeyB64 = await exportPublicKeyBase64(myKeyPair.publicKey);
+      const myKeyPair = await generateRSAKeyPair();
+      const myPubKeyB64 = await exportPublicKeyBase64(myKeyPair.publicKey);
       let otherPublicKey = null;
 
       const qrcodeEl = document.getElementById('qrcode');
@@ -175,16 +155,7 @@
       const createAnswerBtn = document.getElementById('createAnswerBtn');
       const acceptAnswerBtn = document.getElementById('acceptAnswerBtn');
 
-      async function createPeer() {
-        pc = new RTCPeerConnection({ iceServers });
-        pc.oniceconnectionstatechange = () => setStatus(pc.iceConnectionState);
-        pc.onconnectionstatechange = () => setStatus(pc.connectionState);
-        pc.ondatachannel = e => {
-          dataChannel = e.channel;
-          setupDataChannel();
-        };
-      }
-
+      // ---------- Data Channel ----------
       function setupDataChannel() {
         dataChannel.onopen = () => setStatus('Connected');
         dataChannel.onclose = () => setStatus('Disconnected');
@@ -198,13 +169,19 @@
               otherPublicKey = await importPublicKeyFromBase64(msg.pubkey);
               logChat('System: received remote public key');
             }
-          } catch (err) {
-            console.error(err);
-          }
+          } catch (err) { console.error(err); }
         };
       }
 
-      // ---------- Offer / Answer ----------
+      // ---------- Create Peer Connection ----------
+      async function createPeer() {
+        pc = new RTCPeerConnection({ iceServers });
+        pc.oniceconnectionstatechange = () => setStatus(pc.iceConnectionState);
+        pc.onconnectionstatechange = () => setStatus(pc.connectionState);
+        pc.ondatachannel = e => { dataChannel = e.channel; setupDataChannel(); };
+      }
+
+      // ---------- Offer ----------
       createOfferBtn.onclick = async () => {
         await createPeer();
         dataChannel = pc.createDataChannel('chat');
@@ -213,20 +190,20 @@
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        const payload = { type: 'offer', sdp: offer.sdp, pubkey: myPubKeyB64 };
+        // Wait for ICE candidates to finish gathering
+        await new Promise(resolve => {
+          pc.onicecandidate = e => { if (!e.candidate) resolve(); };
+        });
+
+        const payload = { type: 'offer', sdp: pc.localDescription.sdp, pubkey: myPubKeyB64 };
         const payloadStr = JSON.stringify(payload);
         myOfferEl.textContent = payloadStr;
         qrcodeEl.innerHTML = '';
         new QRCode(qrcodeEl, { text: payloadStr, width: 200, height: 200 });
         setStatus('Offer created. Share this with peer.');
-
-        pc.onicecandidate = e => {
-          if (!e.candidate && pc.localDescription) {
-            // final localDescription already included
-          }
-        };
       };
 
+      // ---------- Answer ----------
       createAnswerBtn.onclick = async () => {
         const txt = remotePayloadEl.value.trim();
         if (!txt) return alert('Paste remote offer JSON first');
@@ -236,34 +213,40 @@
         otherPublicKey = await importPublicKeyFromBase64(remote.pubkey);
         await createPeer();
         await pc.setRemoteDescription({ type: 'offer', sdp: remote.sdp });
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
-        const payload = { type: 'answer', sdp: answer.sdp, pubkey: myPubKeyB64 };
+        await new Promise(resolve => {
+          pc.onicecandidate = e => { if (!e.candidate) resolve(); };
+        });
+
+        const payload = { type: 'answer', sdp: pc.localDescription.sdp, pubkey: myPubKeyB64 };
         remotePayloadEl.value = JSON.stringify(payload);
         setStatus('Answer created. Send this JSON back to the offerer.');
       };
 
+      // ---------- Accept Answer ----------
       acceptAnswerBtn.onclick = async () => {
         const txt = remotePayloadEl.value.trim();
         if (!txt) return alert('Paste remote answer JSON first');
         const remote = JSON.parse(txt);
         if (remote.type !== 'answer') return alert('Invalid payload (expected answer)');
+
         otherPublicKey = await importPublicKeyFromBase64(remote.pubkey);
         await pc.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
         setStatus('Connection established!');
-        if (dataChannel?.readyState === 'open') {
+
+        if (dataChannel.readyState === 'open') {
           dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
         } else {
-          dataChannel.onopen = () => {
-            dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
-          };
+          dataChannel.onopen = () => dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
         }
       };
 
+      // ---------- Send Message ----------
       sendBtn.onclick = async () => {
-        if (!dataChannel || dataChannel.readyState !== 'open')
-          return alert('Not connected');
+        if (!dataChannel || dataChannel.readyState !== 'open') return alert('Not connected');
         const txt = msgInput.value.trim();
         if (!txt) return;
         if (!otherPublicKey) return alert('No remote public key known.');
