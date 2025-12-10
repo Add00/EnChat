@@ -15,6 +15,7 @@
 
     .row {
       display: flex;
+      flex-direction: column;
       gap: 12px
     }
 
@@ -54,21 +55,20 @@
   <h1>EnChat</h1>
   <p class="small">
     Uses WebRTC DataChannels for P2P communication and the Web Crypto API for hybrid encryption (AES-GCM + RSA-OAEP).
-    Exchange QR codes or JSON payloads manually to connect peers.
+    Exchange the JSON payloads manually to connect peers.
   </p>
 
   <div class="row">
     <div class="card">
-      <h3>Your Offer (QR / JSON)</h3>
-      <div id="qrcode"></div>
-      <p class="small">Share this QR or JSON with a peer to let them connect to you.</p>
-      <pre id="myOffer" style="width:20em;"></pre>
+      <h3>Your Offer (JSON)</h3>
+      <p class="small">Share this JSON with a peer to let them connect to you.</p>
+      <pre id="myOffer" style="width:20em;" wrap="wrap"></pre>
       <button id="createOfferBtn">Create Offer</button>
     </div>
 
     <div class="card">
       <h3>Connect / Answer</h3>
-      <p class="small">Paste scanned QR JSON here and press the appropriate button.</p>
+      <p class="small">Paste the received JSON here and press a button.</p>
       <textarea id="remotePayload" placeholder='{"type":"offer","sdp":"...","pubkey":"..."}'></textarea>
       <div style="margin-top:8px">
         <button id="createAnswerBtn">Create Answer</button>
@@ -107,12 +107,23 @@
       };
       const setStatus = s => document.getElementById('statusText').textContent = s;
 
+      function toUrlSafe(b64) {
+        return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      }
+
       // ---------- Crypto ----------
       async function generateRSAKeyPair() {
         return crypto.subtle.generateKey({ name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['encrypt', 'decrypt']);
       }
-      async function exportPublicKeyBase64(pubKey) { return abToBase64(await crypto.subtle.exportKey('spki', pubKey)); }
-      async function importPublicKeyFromBase64(b64) { return crypto.subtle.importKey('spki', base64ToAb(b64), { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']); }
+
+      async function exportPublicKeyBase64(pubKey) {
+        return abToBase64(await crypto.subtle.exportKey('spki', pubKey));
+      }
+
+      async function importPublicKeyFromBase64(b64) {
+        return crypto.subtle.importKey('spki', base64ToAb(b64), { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']);
+      }
+
       async function encryptForRecipient(pubKey, plaintext) {
         const aesKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
         const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -121,6 +132,7 @@
         const encryptedAesKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, pubKey, rawAes);
         return { key: abToBase64(encryptedAesKey), ct: abToBase64(ct), iv: abToBase64(iv) };
       }
+
       async function decryptEnvelope(env, privKey) {
         const rawAes = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, privKey, base64ToAb(env.key));
         const aesKey = await crypto.subtle.importKey('raw', rawAes, { name: 'AES-GCM' }, false, ['decrypt']);
@@ -128,14 +140,12 @@
         return new TextDecoder().decode(ptBuf);
       }
 
-      // ---------- Fetch ICE servers ----------
+      // ---------- ICE ----------
       let iceServers;
       try {
         const res = await fetch('https://enchat.metered.live/api/v1/turn/credentials?apiKey=32cff7f5e8c97ce40bfc9ba183026abd3165');
         iceServers = await res.json();
-        console.log("Fetched ICE servers:", iceServers);
       } catch (err) {
-        console.warn('Failed to fetch TURN credentials, using STUN only', err);
         iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
       }
 
@@ -146,7 +156,6 @@
       const myPubKeyB64 = await exportPublicKeyBase64(myKeyPair.publicKey);
       let otherPublicKey = null;
 
-      const qrcodeEl = document.getElementById('qrcode');
       const myOfferEl = document.getElementById('myOffer');
       const remotePayloadEl = document.getElementById('remotePayload');
       const msgInput = document.getElementById('msgInput');
@@ -155,7 +164,7 @@
       const createAnswerBtn = document.getElementById('createAnswerBtn');
       const acceptAnswerBtn = document.getElementById('acceptAnswerBtn');
 
-      // ---------- Data Channel ----------
+      // ---------- Data Channel Setup ----------
       function setupDataChannel() {
         dataChannel.onopen = () => setStatus('Connected');
         dataChannel.onclose = () => setStatus('Disconnected');
@@ -169,11 +178,13 @@
               otherPublicKey = await importPublicKeyFromBase64(msg.pubkey);
               logChat('System: received remote public key');
             }
-          } catch (err) { console.error(err); }
+          } catch (err) {
+            console.error(err);
+          }
         };
       }
 
-      // ---------- Create Peer Connection ----------
+      // ---------- PeerConnection ----------
       async function createPeer() {
         pc = new RTCPeerConnection({ iceServers });
         pc.oniceconnectionstatechange = () => setStatus(pc.iceConnectionState);
@@ -190,27 +201,26 @@
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        // Wait for ICE candidates to finish gathering
         await new Promise(resolve => {
           pc.onicecandidate = e => { if (!e.candidate) resolve(); };
         });
 
         const payload = { type: 'offer', sdp: pc.localDescription.sdp, pubkey: myPubKeyB64 };
-        const payloadStr = JSON.stringify(payload);
-        myOfferEl.textContent = payloadStr;
-        qrcodeEl.innerHTML = '';
-        new QRCode(qrcodeEl, { text: payloadStr, width: 200, height: 200 });
-        setStatus('Offer created. Share this with peer.');
+        myOfferEl.textContent = JSON.stringify(payload);
+
+        setStatus('Offer created. Copy/paste JSON to peer.');
       };
 
-      // ---------- Answer ----------
+      // ---------- Create Answer ----------
       createAnswerBtn.onclick = async () => {
         const txt = remotePayloadEl.value.trim();
         if (!txt) return alert('Paste remote offer JSON first');
+
         const remote = JSON.parse(txt);
         if (remote.type !== 'offer') return alert('Invalid payload (expected offer)');
 
         otherPublicKey = await importPublicKeyFromBase64(remote.pubkey);
+
         await createPeer();
         await pc.setRemoteDescription({ type: 'offer', sdp: remote.sdp });
 
@@ -223,24 +233,28 @@
 
         const payload = { type: 'answer', sdp: pc.localDescription.sdp, pubkey: myPubKeyB64 };
         remotePayloadEl.value = JSON.stringify(payload);
-        setStatus('Answer created. Send this JSON back to the offerer.');
+
+        setStatus('Answer created. Send JSON back to offerer.');
       };
 
       // ---------- Accept Answer ----------
       acceptAnswerBtn.onclick = async () => {
         const txt = remotePayloadEl.value.trim();
         if (!txt) return alert('Paste remote answer JSON first');
+
         const remote = JSON.parse(txt);
         if (remote.type !== 'answer') return alert('Invalid payload (expected answer)');
 
         otherPublicKey = await importPublicKeyFromBase64(remote.pubkey);
         await pc.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
+
         setStatus('Connection established!');
 
         if (dataChannel.readyState === 'open') {
           dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
         } else {
-          dataChannel.onopen = () => dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
+          dataChannel.onopen = () =>
+            dataChannel.send(JSON.stringify({ type: 'pubkey', pubkey: myPubKeyB64 }));
         }
       };
 
@@ -250,13 +264,13 @@
         const txt = msgInput.value.trim();
         if (!txt) return;
         if (!otherPublicKey) return alert('No remote public key known.');
+
         const env = await encryptForRecipient(otherPublicKey, txt);
         dataChannel.send(JSON.stringify({ type: 'envelope', payload: env }));
+
         logChat('Me: ' + txt, 'me');
         msgInput.value = '';
       };
     })();
   </script>
 </body>
-
-</html>
